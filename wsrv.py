@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import time
+import ipaddress
 import subprocess
 import threading
 import queue
@@ -33,6 +34,23 @@ class WServer:
 		self.timeout_seconds = self.conf.get('timeout_seconds', 300)
 		if not isinstance(self.timeout_seconds, (int, float)) or isinstance(self.timeout_seconds, bool) or self.timeout_seconds <= 0:
 			raise ValueError("timeout_seconds must be a positive number")
+
+		if 'ip_whitelist' in self.conf:
+			ip_whitelist = self.conf['ip_whitelist']
+			if not isinstance(ip_whitelist, list):
+				raise ValueError("ip_whitelist must be an array")
+			self.ip_whitelist = []
+			for entry in ip_whitelist:
+				if not isinstance(entry, str) or not entry.strip():
+					raise ValueError("ip_whitelist entries must be non-empty strings")
+				try:
+					self.ip_whitelist.append(ipaddress.ip_network(entry.strip(), strict=False))
+				except ValueError as e:
+					raise ValueError(f"invalid ip_whitelist entry '{entry}': {e}")
+			self.ip_whitelist_enabled = True
+		else:
+			self.ip_whitelist = []
+			self.ip_whitelist_enabled = False
 
 		exec_conf = self.conf.get('exec')
 		if exec_conf is not None:
@@ -107,6 +125,39 @@ class WServer:
 		except subprocess.TimeoutExpired:
 			process.kill()
 			process.wait(timeout=5)
+
+	def _get_client_ip(self, client):
+		address = client.get("address")
+		if not isinstance(address, (tuple, list)) or not address:
+			return None
+		return str(address[0])
+
+	def _is_ip_allowed(self, client):
+		if not self.ip_whitelist_enabled:
+			return True
+
+		client_ip = self._get_client_ip(client)
+		if client_ip is None:
+			return False
+		try:
+			ip = ipaddress.ip_address(client_ip)
+			if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+				ip = ip.ipv4_mapped
+			return any(ip.version == network.version and ip in network for network in self.ip_whitelist)
+		except ValueError:
+			return False
+
+	def _new_client(self, client, server):
+		client_ip = self._get_client_ip(client)
+		if not self._is_ip_allowed(client):
+			self.log.print(f"Rejected connection from non-whitelisted IP: {client_ip or 'unknown'}", 2)
+			try:
+				client["handler"].send_close(1008, b'IP not allowed')
+				server._terminate_client_handler(client["handler"])
+			except Exception as e:
+				self.log.print(f"Unable to reject client connection: {e}", 3)
+			if client in server.clients:
+				server.clients.remove(client)
 
 	def _client_left(self, client, server):
 		client_id = client["id"]
@@ -222,6 +273,7 @@ class WServer:
 		
 	def start(self):
 		server = WebsocketServer(port=self.port, host=self.host)
+		server.set_fn_new_client(self._new_client)
 		server.set_fn_message_received(self._msgReceived)
 		server.set_fn_client_left(self._client_left)
 		self.log.print(f"Listening on {self.host}:{self.port}...", 1)
