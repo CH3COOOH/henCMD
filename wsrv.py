@@ -267,6 +267,8 @@ class WServer:
 				server.clients.remove(client)
 
 	def _client_left(self, client, server):
+		if client is None:
+			return
 		client_id = client["id"]
 		with self.active_processes_lock:
 			record = self.active_processes.pop(client_id, None)
